@@ -6,8 +6,15 @@ on:
     tags:
       - '*'
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+    inputs:
+      scipy:
+        description: 'Run SciPy test suite'
+        required: false
+        default: false
+        type: boolean
   schedule:
   # Twice per week, on Monday and Thursday
   - cron: "0 0 * * 1,4"
@@ -27,15 +34,59 @@ env:
   FORCE_COLOR: 3
 
 jobs:
+  check-scipy-test-trigger:
+    runs-on: ubuntu-latest
+    outputs:
+      test-scipy: ${{ steps.check-build-trigger.outputs.trigger }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Check if SciPy tests should run
+        id: check-build-trigger
+        env:
+          GITHUB_EVENT_PULL_REQUEST_TITLE: ${{ github.event.pull_request.title }}
+          GITHUB_EVENT_INPUTS_SCIPY: ${{ github.event.inputs.scipy }}
+        # Run if commit_msg contains "[scipy]" or
+        # if the PR has the "scipy" label or
+        # if the PR title contains "[scipy]" or if
+        # the workflow is triggered manually with the `scipy` input set to true
+        run: |
+          set -ex
+
+          COMMIT_MSG=$(git log --no-merges -1 --oneline)
+          PR_TITLE="${GITHUB_EVENT_PULL_REQUEST_TITLE}"
+          SCIPY_LABEL=${{ contains(github.event.pull_request.labels.*.name, 'scipy') }}
+          SCIPY_INPUT="${GITHUB_EVENT_INPUTS_SCIPY}"
+          GITHUB_EVENT_NAME="${{ github.event_name }}"
+
+          if [[ "$COMMIT_MSG" =~ \[scipy\] ]] || \
+             [[ "$PR_TITLE" =~ \[scipy\] ]] || \
+             [[ "$SCIPY_LABEL" == "true" ]] || \
+             { [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]] && [[ "$SCIPY_INPUT" == "true" ]]; }
+          then
+            echo "SciPy tests will run"
+            echo "trigger=true" >> $GITHUB_OUTPUT
+          else
+            echo "SciPy tests will not run"
+            echo "trigger=false" >> $GITHUB_OUTPUT
+          fi
+
   build:
     runs-on: ubuntu-latest
+    needs: [check-scipy-test-trigger]
     defaults:
       run:
         shell: bash -l {0}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
 
       - name: Install Emscripten ccache
         run: |
@@ -52,7 +103,7 @@ jobs:
           which ccache
 
       - name: Cache conda
-        uses: actions/cache@v4
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ~/conda_pkgs_dir
           key:
@@ -60,7 +111,7 @@ jobs:
             hashFiles('environment.yml') }}
 
       - name: Setup Mambaforge
-        uses: conda-incubator/setup-miniconda@v3
+        uses: conda-incubator/setup-miniconda@835234971496cad1653abb28a638a281cf32541f # v3.2.0
         with:
           miniforge-variant: Miniforge3
           miniforge-version: latest
@@ -74,7 +125,7 @@ jobs:
 
       - name: Cache Conda env
         id: conda-cache
-        uses: actions/cache@v4
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.CONDA }}/envs
           key:
@@ -85,27 +136,22 @@ jobs:
           mamba env update -n pyodide-env -f environment.yml
         if: steps.conda-cache.outputs.cache-hit != 'true'
 
-      # ref. https://github.com/apache/flink/blob/master/tools/azure-pipelines/free_disk_space.sh#L28-L53
-      - name: Free unused disk space
+      # See https://github.com/jlumbroso/free-disk-space/issues/40
+      - name: Disable man-db to free up disk space faster
         run: |
-          # delete packages
-          sudo apt-get remove -y '^dotnet-.*' || true
-          sudo apt-get remove -y '^llvm-.*' || true
-          sudo apt-get remove -y '^temurin-.*' || true
-          sudo apt-get remove -y '^mysql-server-core-.*' || true
-          sudo apt-get remove -y '^postgresql-.*' || true
-          sudo apt-get remove -y azure-cli google-chrome-stable google-cloud-cli firefox powershell microsoft-edge-stable mono-devel || true
-          sudo apt-get autoremove -y
-          sudo apt-get clean
+          echo 'set man-db/auto-update false' | sudo debconf-communicate >/dev/null
+          sudo dpkg-reconfigure man-db
 
-          # delete directories
-          sudo rm -rf /usr/share/dotnet/
-          sudo rm -rf /usr/share/swift/
-          sudo rm -rf /usr/local/graalvm/
-          sudo rm -rf /usr/local/.ghcup/
-          sudo rm -rf /usr/local/share/powershell
-          sudo rm -rf /usr/local/share/chromium
-          sudo rm -rf /usr/local/lib/android
+      - name: Free unused disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false # https://github.com/jlumbroso/free-disk-space/issues/12
 
       - name: Install latest pyodide-build and build dependencies
         run : |
@@ -126,7 +172,7 @@ jobs:
           fi
 
       - name: Cache ccache
-        uses: actions/cache@v4
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.CCACHE_DIR }}
           key: ${{ env.CCACHE_DIR }}-${{ env.CCACHE_CACHE_NUMBER }}-${{ env.EMSCRIPTEN_VERSION }}-${{ runner.os }}${{ env.CCACHE_SUFFIX }}
@@ -136,18 +182,44 @@ jobs:
       - name: Calculate recipes to build (pull_request)
         if: github.event_name == 'pull_request'
         id: calculate_recipes_pr
+        env:
+          GITHUB_EVENT_PULL_REQUEST_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          NEEDS_CHECK_SCIPY_TEST_TRIGGER_OUTPUTS_TEST_SCIPY: ${{ needs.check-scipy-test-trigger.outputs.test-scipy }}
         run: |
           export CHANGED_RECIPES=$(python ./tools/calc_diff.py \
-            --base origin/${{ github.event.pull_request.base.ref }} \
+            --base origin/${GITHUB_EVENT_PULL_REQUEST_BASE_REF} \
             --target ${{ github.sha }})
 
           echo "Changed recipes: $CHANGED_RECIPES"
 
+          # Check if scipy should be included
+          SCIPY_WILL_BE_TESTED="${NEEDS_CHECK_SCIPY_TEST_TRIGGER_OUTPUTS_TEST_SCIPY}"
+
           # If there are no changed recipes, we build only core packages sets
           if [ -z "$CHANGED_RECIPES" ]; then
-            echo "recipes=tag:core" >> "$GITHUB_OUTPUT"
+            # No changed recipes
+            if [ "$SCIPY_WILL_BE_TESTED" == "true" ]; then
+              echo "recipes=tag:core,scipy" >> "$GITHUB_OUTPUT"
+              echo "Building: tag:core,scipy (no changes + scipy trigger)"
+            else
+              echo "recipes=tag:core" >> "$GITHUB_OUTPUT"
+              echo "Building: tag:core (no changes)"
+            fi
           else
-            echo "recipes=$CHANGED_RECIPES,tag:core" >> "$GITHUB_OUTPUT"
+            # There are changed recipes
+            if [ "$SCIPY_WILL_BE_TESTED" == "true" ]; then
+              # Check if scipy is already in changed recipes to avoid duplication
+              if [[ "$CHANGED_RECIPES" == *"scipy"* ]]; then
+                echo "recipes=$CHANGED_RECIPES,tag:core" >> "$GITHUB_OUTPUT"
+                echo "Building: $CHANGED_RECIPES,tag:core (scipy already included in changes)"
+              else
+                echo "recipes=$CHANGED_RECIPES,tag:core,scipy" >> "$GITHUB_OUTPUT"
+                echo "Building: $CHANGED_RECIPES,tag:core,scipy (changes + scipy trigger)"
+              fi
+            else
+              echo "recipes=$CHANGED_RECIPES,tag:core" >> "$GITHUB_OUTPUT"
+              echo "Building: $CHANGED_RECIPES,tag:core (changes only)"
+            fi
           fi
 
       - name: Build recipes (full)
@@ -164,6 +236,8 @@ jobs:
 
       - name: Build recipes (changed only)
         if: github.event_name == 'pull_request' && !contains(github.event.pull_request.title, '[full build]')
+        env:
+          STEPS_CALCULATE_RECIPES_PR_OUTPUTS_RECIPES: ${{ steps.calculate_recipes_pr.outputs.recipes }}
         run: |
           ccache -z
           export _EMCC_CACHE=1
@@ -171,7 +245,7 @@ jobs:
           export PIP_CONSTRAINT=$(pwd)/tools/constraints.txt
           source emsdk/emsdk_env.sh
           mkdir -p result
-          pyodide build-recipes ${{ steps.calculate_recipes_pr.outputs.recipes }} --install --install-dir=./repodata --log-dir=build-logs | tee result/build_output.log
+          pyodide build-recipes ${STEPS_CALCULATE_RECIPES_PR_OUTPUTS_RECIPES} --install --install-dir=./repodata --log-dir=build-logs | tee result/build_output.log
           ccache -s
 
       - name: Parse build results
@@ -196,7 +270,7 @@ jobs:
         run: |
           ./tools/copy_pyodide_runtime.sh ./repodata
       - name: Store the build summary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: github.event_name == 'pull_request' && env.SUMMARY_CREATED == 'true'
         with:
           name: build-result
@@ -204,21 +278,21 @@ jobs:
           retention-days: 7
 
       - name: Store artifacts build
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: repodata
           path: ./repodata/
           retention-days: 7
       
       - name: Store build logs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: build-log
           path: ./build-logs/
           retention-days: 7
 
       - name: Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -243,10 +317,14 @@ jobs:
         ]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
 
       - name: Cache conda
-        uses: actions/cache@v4
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ~/conda_pkgs_dir
           key:
@@ -254,7 +332,7 @@ jobs:
             hashFiles('environment.yml') }}
 
       - name: Setup Mambaforge
-        uses: conda-incubator/setup-miniconda@v3
+        uses: conda-incubator/setup-miniconda@835234971496cad1653abb28a638a281cf32541f # v3.2.0
         with:
           miniforge-variant: Miniforge3
           miniforge-version: latest
@@ -268,7 +346,7 @@ jobs:
 
       - name: Cache Conda env
         id: conda-cache
-        uses: actions/cache@v4
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.CONDA }}/envs
           key:
@@ -279,14 +357,14 @@ jobs:
           mamba env update -n pyodide-env -f environment.yml
         if: steps.conda-cache.outputs.cache-hit != 'true'
 
-      - uses: pyodide/pyodide-actions/install-browser@v2
+      - uses: pyodide/pyodide-actions/install-browser@012fa537869d343726d01863a34b773fc4d96a14 # v2
         with:
           runner: ${{ matrix.test-config.runner }}
           browser: ${{ matrix.test-config.runtime }}
           browser-version: ${{ matrix.test-config.runtime-version }}
 
       - name: Download build artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: repodata
           path: ./dist/
@@ -304,6 +382,92 @@ jobs:
             --runner=${{ matrix.test-config.runner }} \
             --rt ${{ matrix.test-config.runtime }} \
             packages
+
+  # This job runs the SciPy tests with Node.js based on the
+  # above checks; separate from the main test job.
+  test-scipy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash -l {0}
+    needs: [build, check-scipy-test-trigger]
+    if: needs.check-scipy-test-trigger.outputs.test-scipy == 'true'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Cache conda
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~/conda_pkgs_dir
+          key:
+            ${{ runner.os }}-conda-${{ env.CONDA_CACHE_NUMBER }}-${{ hashFiles('environment.yml') }}
+
+      - name: Setup Mambaforge
+        uses: conda-incubator/setup-miniconda@835234971496cad1653abb28a638a281cf32541f # v3.2.0
+        with:
+          miniforge-variant: Miniforge3
+          miniforge-version: latest
+          activate-environment: pyodide-env
+          conda-remove-defaults: true
+          channels: conda-forge
+
+      - name: Get Date
+        id: get-date
+        run: echo "today=$(/bin/date -u '+%Y%m%d')" >> $GITHUB_OUTPUT
+
+      - name: Cache Conda env
+        id: conda-cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.CONDA }}/envs
+          key:
+            conda-${{ runner.os }}-${{ steps.get-date.outputs.today }}-${{ hashFiles('environment.yml') }}-${{ env.CONDA_CACHE_NUMBER }}
+
+      - name: Update environment if cache miss
+        run:
+          mamba env update -n pyodide-env -f environment.yml
+        if: steps.conda-cache.outputs.cache-hit != 'true'
+
+      - name: Download build artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: repodata
+          path: ./dist/
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+
+      - name: Prepare SciPy test environment
+        run: |
+          # First, install any version of pyodide from npm
+          # to get the file structure
+          npm install pyodide
+
+          # Copy the Pyodide runtime to the dist folder
+          ./tools/copy_pyodide_runtime.sh ./dist
+
+          # Copy the Pyodide files from the dist folder to the
+          # node_modules/pyodide folder, so that the SciPy tests
+          # can find them
+          cp -f dist/* node_modules/pyodide
+
+          # Delete conftest.py from repo root to avoid conflicts
+          rm -rf conftest.py
+
+          # Change scipy-conftest.py to conftest.py as pytest
+          # doesn't seem to recognise it otherwise
+          mv packages/scipy/scipy-conftest.py packages/scipy/conftest.py
+
+      - name: Run SciPy test suite
+        run: node scipy-pytest.js --pyargs scipy -m "not slow" -vra
+        working-directory: packages/scipy/
+
   release:
     runs-on: ubuntu-latest
     defaults:
@@ -313,12 +477,14 @@ jobs:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     environment: deploy
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
 
       - name: Setup Mambaforge
-        uses: conda-incubator/setup-miniconda@v3
+        uses: conda-incubator/setup-miniconda@835234971496cad1653abb28a638a281cf32541f # v3.2.0
         with:
           miniforge-variant: Miniforge3
           miniforge-version: latest
@@ -327,7 +493,7 @@ jobs:
           channels: conda-forge
 
       - name: Download build artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: repodata
           path: ./repodata/
